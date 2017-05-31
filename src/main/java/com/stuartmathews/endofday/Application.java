@@ -11,13 +11,18 @@ import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.text.SimpleDateFormat;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Stack;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.commons.httpclient.HttpClient;
@@ -70,6 +75,7 @@ public class Application
 
    private void start(String[] args, Environment env, FileWriter errorLog) throws Exception
    {
+      long startTime = System.currentTimeMillis();
       System.out.println(Arrays.toString(args));
       /*
       Program defaults:
@@ -132,6 +138,9 @@ public class Application
          System.out.printf(fmt);
          errorLog.append(fmt);
       }
+      long endTime   = System.currentTimeMillis();
+      long secs = (endTime - startTime)/1000;
+      System.out.printf("Entire execution time was %d secs or %d minutes.\n",secs, secs /60);
    }
 
    static String GetStringFromFileContents(String path, Charset encoding) throws IOException
@@ -152,9 +161,7 @@ public class Application
    {
       java.util.Scanner s = new java.util.Scanner(is).useDelimiter("\\A");
       return s.hasNext() ? s.next() : "";
-   }
-   
-   final static Object QuotesLock = new Object();
+   }   
 
    /***
     * Returns all the stock details for the companies provided in company file 
@@ -165,66 +172,68 @@ public class Application
     */
    public static String GenerateEndOfDayCSV(String csv, Environment env, FileWriter errorLog) throws Exception
    {
-      // Keep track of our data
-      HashMap<String, TickerDetailsQuote> Quotes = new HashMap<>();
-      ArrayList<String> excludedCompanies;
-      
-      
-      System.out.printf("using company file '%s'\n", env.getProperty("company.filename"));
+      AbstractMap<String, TickerDetailsQuote> Quotes = new ConcurrentHashMap<>();
+      Queue<Thread> threads = new ConcurrentLinkedQueue<>();
+      ArrayList<String> excludedCompanies;      
+      System.out.printf("Using company file '%s'\n", env.getProperty("company.filename"));
       String[] companyFileLines = csv.split(System.getProperty("line.separator"));
+      
       // Fetch companies to excluded
-      excludedCompanies = GetExcludedCompanies(env.getProperty("company.excludefile"));
-
-      int lineCount = 0;
-      Collection<Thread> threads = new ArrayList<>();      
+      excludedCompanies = GetExcludedCompanies(env.getProperty("company.excludefile"));     
+      int max_threads = env.getProperty("threads.count", int.class);
+      System.out.printf("Using max threads '%d'\n", max_threads);
+      AtomicInteger count = new AtomicInteger(0);
       
       for (String line : companyFileLines)
       {
-         if(threads.size() != MAX_THREADS){ 
-             System.out.printf("Starting new thread\n");
+        if (line.isEmpty()) {
+            continue;            
+        }
+        else if (excludedCompanies.contains(line)) {
+                System.out.printf("Excluding company '%s'\n", line);                
+        }
+          
+         if(threads.size() != max_threads){ 
+             //System.out.printf("Starting new thread\n");
              Thread thread = new Thread(() -> {
                 try {
-                    DoRequestForCompany(line, excludedCompanies, env, errorLog, Quotes, lineCount);                                        
+                    TickerDetailsQuote quote = DoRequestForCompany(line, env, errorLog);                    
+                    System.out.printf("%d: Company='%s', Ask='%s'\n",line, quote.getLastTradePriceOnly(),count.getAndIncrement());
+                    if(!Quotes.containsKey(line)){
+                        Quotes.put(line, quote);                        
+                    }
                 } catch (IOException ex) {                    
                     Logger.getLogger(Application.class.getName()).log(Level.SEVERE, null, ex);
                 }
-            });
+            });             
              
             threads.add(thread);
             thread.start();
          }
          else
          {
-            System.out.printf("Thread queue maxed out. need to remove a finished thread..\n");
-            boolean anyFree = false;
-            for(Thread thread : threads){
-                if(!thread.isAlive()){
-                    System.out.printf("Thread finished, removing it\n");
-                    threads.remove(thread);
-                    anyFree = true;
-                }
-            }
-            threads.iterator().next().join();
+            //System.out.printf("Thread queue maxed out. need to remove a finished thread..\n");            
+            Thread thread = threads.element();
+            System.out.printf(".");  
+            thread.join();
+            threads.remove(thread);
+            
          }
                      
       }
+      
+      System.out.printf("Preparing results...\n");
       // Convert the tracked quote data list into a CSV string and return to caller
       return ObjectListToCSV.convertListToCSV(new ArrayList<TickerDetailsQuote>(Quotes.values()));
    }
-    private static final int MAX_THREADS = 2;
+    
 
-    private static boolean DoRequestForCompany(String line, ArrayList<String> excludedCompanies, Environment env, FileWriter errorLog, HashMap<String, TickerDetailsQuote> Quotes, int lineCount) throws IOException 
+    private static TickerDetailsQuote DoRequestForCompany(String line, Environment env, FileWriter errorLog) throws IOException 
     {
-        if (line.isEmpty()) {
-            return true;
-        }
+        TickerDetailsQuote quote = new TickerDetailsQuote();
         String[] values = line.split(",");
         String company = values[0];
-        if (!company.isEmpty()) {
-            if (excludedCompanies.contains(company)) {
-                System.out.printf("Excluding company '%s'\n", company);
-                return true;
-            }
+        if (!company.isEmpty()) {            
             // used to make HTTP requests
             HttpClient web = new HttpClient();
             // The company name might have spaces so need to encode if going to pass as URL data
@@ -259,7 +268,6 @@ public class Application
                                 System.out.printf(fmt);
                                 //errorLog.append(fmt);
                             }
-                            return true;
                         }
                         // Store resolved compnay to ticker symbol for later on...
                         ticker = nameResult.getResultSet().getResult().get(0).getsymbol();
@@ -286,26 +294,15 @@ public class Application
                     if (tickerResult.getquery().getcount() == 0) {
                         String fmt = String.format("Ignoring bad response data for quote for company '%s'. Skipping company....\n", company);
                         System.out.printf(fmt);
-                        //synchronized(errorLogLock){ errorLog.append(fmt); }
-                        return true;
+                        //synchronized(errorLogLock){ errorLog.append(fmt); }                        
                     }
                     // Save the ticker stock details
-                    TickerDetailsQuote quote = tickerResult.getquery().getresults().getquote();
+                    quote = tickerResult.getquery().getresults().getquote();
                     // Alwasys ensure that the company name is set
                     quote.setFullName(company);
-                    synchronized(QuotesLock){
-                        // Store ticker quote pe rcompany if we dont know about it yet.
-                        if (!Quotes.containsKey(company)) {
-                            Quotes.put(company, quote);
-                            // Increase how many companies we've queried so far 
-                            lineCount++;
-                        }
-                    }
-                  // Out put to show we're doing something.
-                  System.out.printf("%d-Company=''Ticker='%s', Ask='%s'\n",
-                          lineCount,
-                          ticker,
-                          tickerResult.getquery().getresults().getquote().getLastTradePriceOnly());
+                    
+                    return quote;
+                    
                 }catch (IOException | JsonSyntaxException e)
                {
                    String fmt = String.format("Error while getting ticker quote details for'%s': %s\n", ticker, e.getMessage());
@@ -319,7 +316,7 @@ public class Application
                 //synchronized(errorLogLock){ errorLog.append(fmt); }
             }
         }
-        return false;
+        return quote;
     }
     
     private static ArrayList<String> GetExcludedCompanies(String filename) throws IOException
