@@ -198,7 +198,7 @@ public class Application
              Thread thread = new Thread(() -> {
                 try {
                     TickerDetailsQuote quote = DoRequestForCompany(line, env, errorLog);                    
-                    System.out.printf("%d: Company='%s', Ask='%s'\n",line, quote.getLastTradePriceOnly(),count.getAndIncrement());
+                    System.out.printf("%d: Company='%s', Ask='%s'\n",count.getAndIncrement(),line, quote.getLastTradePriceOnly());
                     if(!Quotes.containsKey(line)){
                         Quotes.put(line, quote);                        
                     }
